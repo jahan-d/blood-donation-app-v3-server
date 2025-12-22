@@ -1,7 +1,6 @@
-require("dotenv").config();
-
 const express = require("express");
 const app = express();
+require("dotenv").config();
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const Stripe = require("stripe");
@@ -9,34 +8,16 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 const port = process.env.PORT || 5000;
 
-/* ======================
-   ENV CHECK
-====================== */
-if (!process.env.MONGO_URI || !process.env.JWT_SECRET || !process.env.STRIPE_SECRET_KEY) {
-  console.error("❌ Missing environment variables");
-  process.exit(1);
-}
-
-/* ======================
-   MIDDLEWARE
-====================== */
-app.use(
-  cors({
-    origin: [process.env.CLIENT_URL, "http://localhost:5173"],
-    credentials: true,
-  })
-);
+// Middleware
 app.use(express.json());
+app.use(cors());
 
-/* ======================
-   STRIPE
-====================== */
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-/* ======================
-   MONGODB
-====================== */
-const client = new MongoClient(process.env.MONGO_URI, {
+const uri = process.env.MONGO_URI;
+
+// MongoDB Client
+const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
@@ -44,12 +25,8 @@ const client = new MongoClient(process.env.MONGO_URI, {
   },
 });
 
-let usersCollection;
-let donationRequestsCollection;
-let fundsCollection;
-
 /* ======================
-   JWT VERIFY
+   HELPERS
 ====================== */
 const verifyJWT = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -63,179 +40,123 @@ const verifyJWT = (req, res, next) => {
   });
 };
 
-/* ======================
-   ROLE GUARD
-====================== */
-const requireRole = (...roles) => {
-  return async (req, res, next) => {
-    const user = await usersCollection.findOne({ email: req.decoded.email });
-    if (!user || !roles.includes(user.role)) {
-      return res.status(403).send({ message: "Access denied" });
-    }
-    req.currentUser = user;
-    next();
-  };
-};
-
 async function run() {
   try {
+    // Connect to MongoDB
+    await client.connect();
+
     const db = client.db("bloodDonationDB");
-    usersCollection = db.collection("users");
-    donationRequestsCollection = db.collection("donationRequests");
-    fundsCollection = db.collection("funds");
+    const usersCollection = db.collection("users");
+    const donationRequestsCollection = db.collection("donationRequests");
+    const fundsCollection = db.collection("funds");
+    const blogsCollection = db.collection("blogs");
+
+    // Role Guard Middleware (Must be inside run to access usersCollection)
+    const requireRole = (...roles) => {
+      return async (req, res, next) => {
+        const user = await usersCollection.findOne({ email: req.decoded.email });
+        if (!user || !roles.includes(user.role)) {
+          return res.status(403).send({ message: "Access denied" });
+        }
+        next();
+      };
+    };
 
     /* ======================
-       AUTH
+       ROUTES
     ====================== */
+
+    // AUTH
     app.post("/jwt", async (req, res) => {
-      const { email } = req.body;
-      const user = await usersCollection.findOne({ email });
-
+      const user = await usersCollection.findOne({ email: req.body.email });
       if (!user) return res.status(401).send({ message: "Unauthorized" });
-
-      const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: "7d" });
+      const token = jwt.sign({ email: user.email }, process.env.JWT_SECRET, { expiresIn: "7d" });
       res.send({ token });
     });
 
-    /* ======================
-       USERS
-    ====================== */
+    // USERS
     app.post("/users", async (req, res) => {
       const exists = await usersCollection.findOne({ email: req.body.email });
       if (exists) return res.send({ message: "User already exists" });
-
-      const user = {
-        email: req.body.email,
-        name: req.body.name,
-        avatar: req.body.avatar,
-        bloodGroup: req.body.bloodGroup,
-        district: req.body.district,
-        upazila: req.body.upazila,
-        role: "donor",
-        status: "active",
-        createdAt: new Date(),
-      };
-
+      const user = { ...req.body, role: "donor", status: "active", createdAt: new Date() };
       const result = await usersCollection.insertOne(user);
       res.status(201).send({ ...user, _id: result.insertedId });
     });
 
     app.get("/users", verifyJWT, requireRole("admin"), async (req, res) => {
-      const status = req.query.status;
+      const { status, page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
       const query = status ? { status } : {};
-      res.send(await usersCollection.find(query).toArray());
+      const total = await usersCollection.countDocuments(query);
+      const users = await usersCollection.find(query).skip(skip).limit(parseInt(limit)).toArray();
+      res.send({ users, total });
     });
 
     app.get("/users/profile", verifyJWT, async (req, res) => {
-      const user = await usersCollection.findOne({ email: req.decoded.email });
-      res.send(user);
+      res.send(await usersCollection.findOne({ email: req.decoded.email }));
     });
 
     app.put("/users/profile", verifyJWT, async (req, res) => {
       const updateData = { ...req.body };
       delete updateData.email;
       delete updateData._id;
-
-      const result = await usersCollection.updateOne(
-        { email: req.decoded.email },
-        { $set: updateData }
-      );
-      res.send(result);
+      res.send(await usersCollection.updateOne({ email: req.decoded.email }, { $set: updateData }));
     });
 
     app.patch("/users/role/:id", verifyJWT, requireRole("admin"), async (req, res) => {
-      const updateData = { ...req.body };
-      delete updateData._id;
-
-      res.send(
-        await usersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: updateData }
-        )
-      );
+      res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: req.body.role } }));
     });
 
     app.patch("/users/status/:id", verifyJWT, requireRole("admin"), async (req, res) => {
-      const updateData = { ...req.body };
-      delete updateData._id;
-
-      res.send(
-        await usersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: updateData }
-        )
-      );
+      res.send(await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status } }));
     });
 
-    /* ======================
-       DONATION REQUESTS
-    ====================== */
+    // DONATION REQUESTS
     app.post("/donation-requests", verifyJWT, async (req, res) => {
       const user = await usersCollection.findOne({ email: req.decoded.email });
       if (user.status === "blocked") return res.status(403).send({ message: "User blocked" });
-
-      const request = {
-        ...req.body,
-        requesterEmail: req.decoded.email,
-        status: "pending",
-        createdAt: new Date(),
-      };
-
-      const result = await donationRequestsCollection.insertOne(request);
-      res.status(201).send(result);
+      const request = { ...req.body, requesterEmail: req.decoded.email, status: "pending", createdAt: new Date() };
+      res.send(await donationRequestsCollection.insertOne(request));
     });
 
     app.get("/donation-requests/public", async (req, res) => {
       res.send(await donationRequestsCollection.find({ status: "pending" }).toArray());
     });
 
-    // Server-side search endpoint
     app.get("/donation-requests/search", async (req, res) => {
-      try {
-        const { q } = req.query;
-        if (!q) {
-          const allRequests = await donationRequestsCollection
-            .find({ status: "pending" })
-            .toArray();
-          return res.send(allRequests);
-        }
+      const { q } = req.query;
+      if (!q) return res.send(await donationRequestsCollection.find({ status: "pending" }).toArray());
+      const regex = new RegExp(q, "i");
+      res.send(await donationRequestsCollection.find({
+        status: "pending",
+        $or: [{ bloodGroup: regex }, { district: regex }, { upazila: regex }]
+      }).toArray());
+    });
 
-        const searchRegex = new RegExp(q, "i");
-        const filteredRequests = await donationRequestsCollection
-          .find({
-            status: "pending",
-            $or: [
-              { bloodGroup: searchRegex },
-              { district: searchRegex },
-              { upazila: searchRegex },
-            ],
-          })
-          .toArray();
-
-        res.send(filteredRequests);
-      } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: "Server error" });
-      }
+    app.get("/search/donors", async (req, res) => {
+      const { bloodGroup, district, upazila } = req.query;
+      const query = { role: "donor" };
+      if (bloodGroup) query.bloodGroup = bloodGroup;
+      if (district) query.district = district;
+      if (upazila) query.upazila = upazila;
+      res.send(await usersCollection.find(query).toArray());
     });
 
     app.get("/donation-requests", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
       const { status, page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
       const query = status ? { status } : {};
-
-      res.send(
-        await donationRequestsCollection
-          .find(query)
-          .skip((page - 1) * limit)
-          .limit(Number(limit))
-          .toArray()
-      );
+      res.send(await donationRequestsCollection.find(query).skip(skip).limit(parseInt(limit)).toArray());
     });
 
     app.get("/donation-requests/my", verifyJWT, async (req, res) => {
-      res.send(
-        await donationRequestsCollection.find({ requesterEmail: req.decoded.email }).toArray()
-      );
+      const { status, page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const query = { requesterEmail: req.decoded.email };
+      if (status) query.status = status;
+      const total = await donationRequestsCollection.countDocuments(query);
+      const requests = await donationRequestsCollection.find(query).skip(skip).limit(parseInt(limit)).toArray();
+      res.send({ requests, total });
     });
 
     app.get("/donation-requests/:id", verifyJWT, async (req, res) => {
@@ -243,73 +164,54 @@ async function run() {
     });
 
     app.put("/donation-requests/:id", verifyJWT, async (req, res) => {
-      const request = await donationRequestsCollection.findOne({ _id: new ObjectId(req.params.id) });
-      const currentUser = await usersCollection.findOne({ email: req.decoded.email });
-
-      if (request.requesterEmail !== req.decoded.email && currentUser.role !== "admin") {
-        return res.status(403).send({ message: "Forbidden" });
-      }
-
       const updateData = { ...req.body };
       delete updateData._id;
+      res.send(await donationRequestsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: updateData }));
+    });
 
-      res.send(
-        await donationRequestsCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: updateData }
-        )
-      );
+    app.patch("/donation-requests/donate/:id", verifyJWT, async (req, res) => {
+      res.send(await donationRequestsCollection.updateOne({ _id: new ObjectId(req.params.id) }, {
+        $set: { status: "inprogress", donorName: req.decoded.name, donorEmail: req.decoded.email }
+      }));
     });
 
     app.patch("/donation-requests/status/:id", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
-      const updateData = { ...req.body };
-      delete updateData._id;
-
-      res.send(
-        await donationRequestsCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: updateData }
-        )
-      );
+      res.send(await donationRequestsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status } }));
     });
 
     app.delete("/donation-requests/:id", verifyJWT, async (req, res) => {
-      res.send(
-        await donationRequestsCollection.deleteOne({ _id: new ObjectId(req.params.id) })
-      );
+      res.send(await donationRequestsCollection.deleteOne({ _id: new ObjectId(req.params.id) }));
     });
 
-    /* ======================
-       FUNDING
-    ====================== */
+    // BLOGS
+    app.post("/blogs", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
+      const blog = { ...req.body, author: req.decoded.email, status: "published", createdAt: new Date() };
+      res.send(await blogsCollection.insertOne(blog));
+    });
+
+    app.get("/blogs", async (req, res) => {
+      res.send(await blogsCollection.find({ status: "published" }).sort({ createdAt: -1 }).toArray());
+    });
+
+    // FUNDING
     app.post("/create-payment-intent", verifyJWT, async (req, res) => {
       const { amount } = req.body;
-      if (!amount || amount <= 0) return res.status(400).send({ message: "Invalid amount" });
-
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: amount * 100,
-        currency: "bdt",
-        payment_method_types: ["card"],
-      });
-
-      res.send({ clientSecret: paymentIntent.client_secret });
+      if (!amount) return res.status(400).send({ message: "Invalid amount" });
+      const pi = await stripe.paymentIntents.create({ amount: amount * 100, currency: "bdt", payment_method_types: ["card"] });
+      res.send({ clientSecret: pi.client_secret });
     });
 
     app.post("/funds", verifyJWT, async (req, res) => {
-      const fund = {
-        userName: req.body.userName,
-        email: req.decoded.email,
-        amount: Number(req.body.amount),
-        transactionId: req.body.transactionId,
-        createdAt: new Date(),
-      };
-
-      const result = await fundsCollection.insertOne(fund);
-      res.status(201).send(result);
+      const fund = { ...req.body, email: req.decoded.email, amount: Number(req.body.amount), createdAt: new Date() };
+      res.send(await fundsCollection.insertOne(fund));
     });
 
     app.get("/funds", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
-      res.send(await fundsCollection.find().sort({ createdAt: -1 }).toArray());
+      const { page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const total = await fundsCollection.countDocuments();
+      const funds = await fundsCollection.find().sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).toArray();
+      res.send({ funds, total });
     });
 
     app.get("/funds/total", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
@@ -317,17 +219,13 @@ async function run() {
       res.send({ total: data[0]?.total || 0 });
     });
 
-    console.log("✅ Backend fully upgraded & production ready");
-  } catch (err) {
-    console.error("❌ Server error:", err);
+  } finally {
+    // Leave empty or close if needed
   }
 }
 
-run();
+run().catch(console.dir);
 
-/* ======================
-   ROOT
-====================== */
 app.get("/", (req, res) => {
   res.send("Blood Donation API Running");
 });
@@ -335,3 +233,5 @@ app.get("/", (req, res) => {
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });
+
+module.exports = app;
