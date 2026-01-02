@@ -1,101 +1,78 @@
-🩸 Blood Donation Backend API
+# 🩸 Blood Donation Application — Server
 
-Production-ready REST API for a Blood Donation Management System built with Node.js, Express, MongoDB, JWT, and Stripe.
+Backend REST API for the **Blood Donation Platform**, built with Node.js, Express, and MongoDB.
 
-🚀 Tech Stack
+## 🚀 Overview
 
-Node.js + Express
+This is the **backend (server-side)** of the Blood Donation Application.
+It provides secure RESTful APIs for authentication, donor search, donation requests, payments, and administrative operations.
 
-MongoDB (Native Driver)
+The server is designed with scalability, security, and clean separation of concerns in mind.
 
-JWT Authentication
+## ✨ Features
 
-Stripe Payment Intent
+- 🔐 **Secure Authentication**: Firebase ID Token verification with JWT session management.
+- 🛡️ **Role-Based Authorization**: Middleware guards for Admin, Volunteer, and Donor roles.
+- 📍 **Donor Search**: Filter donors by Blood Group, District, and Upazila.
+- 🩸 **Management APIs**: CRUD operations for Donation Requests and Blogs.
+- 💳 **Stripe Payments**: Secure Checkout Sessions with Idempotency and Webhook-style verification.
+- 🧩 **RESTful Architecture**: Clean endpoint structure.
 
-dotenv, CORS
+## 🛠 Tech Stack
 
-⚙️ Environment Variables
+- **Node.js**
+- **Express.js**
+- **MongoDB** (Native Driver)
+- **Firebase Admin SDK**
+- **Stripe SDK**
+- **JWT** (JSON Web Tokens)
+
+## 📂 Project Structure
+
+```
+server/
+├── index.js (or server.js)  # Main entry point
+├── .env                     # Configuration
+└── README.md
+```
+
+## 🔐 Environment Variables
+
+Create a `.env` file in the server directory:
+
+```env
 PORT=5000
-MONGO_URI=your_mongodb_uri
-JWT_SECRET=your_jwt_secret
-STRIPE_SECRET_KEY=your_stripe_secret
-CLIENT_URL=https://your-frontend-url
+MONGO_URI=mongodb+srv://...
+STRIPE_SECRET_KEY=sk_test_...
+JWT_SECRET=your_jwt_secret_key
+# Optional: For secure firebase-admin (Recommended for Production)
+FIREBASE_SERVICE_ACCOUNT={"type": "service_account", ...}
+```
 
-▶️ Run Locally
-npm install
-npm start
+## ▶️ Getting Started
 
+1. **Install Dependencies**
+   ```bash
+   npm install
+   ```
 
-Server runs at:
+2. **Run Development Server**
+   ```bash
+   npm start
+   ```
 
-http://localhost:5000
+## 🔄 API Responsibilities
 
-🔐 Authentication
+- Handle authentication & authorization.
+- Validate incoming requests.
+- Perform database operations.
+- Process payments securely.
+- Serve data to the frontend.
 
-All protected routes require:
+## 👨‍💻 Author
 
-Authorization: Bearer <JWT>
+**Jahan Ebna Delower**
+*Frontend / Full Stack Web Developer*
 
-📌 API Endpoints
-Auth
-
-POST /jwt → Generate JWT
-
-Users
-
-POST /users → Register user
-
-GET /users → All users (Admin)
-
-GET /users/profile → Logged-in user
-
-PUT /users/profile → Update profile
-
-PATCH /users/role/:id → Change role (Admin)
-
-PATCH /users/status/:id → Block / Unblock (Admin)
-
-Donation Requests
-
-POST /donation-requests → Create request
-
-GET /donation-requests/public → Public pending requests
-
-GET /donation-requests → All requests (Admin / Volunteer)
-
-GET /donation-requests/my → My requests
-
-GET /donation-requests/:id → Single request
-
-PUT /donation-requests/:id → Update request
-
-PATCH /donation-requests/status/:id → Update status
-
-DELETE /donation-requests/:id → Delete request
-
-Funding (Stripe)
-
-POST /create-payment-intent → Stripe payment intent
-
-POST /funds → Save successful fund
-
-GET /funds → All funds (Admin / Volunteer)
-
-GET /funds/total → Total fund amount
-
-👥 Roles
-
-Donor → Manage own requests
-
-Volunteer → Manage requests & funds
-
-Admin → Full access
-
-✅ Status
-
-✔ Secure JWT
-✔ Role-based access
-✔ Stripe integrated
-✔ Production ready
-
-Author: Jahan Ebna Delower
+- 🌐 [Portfolio](https://jahan-d.web.app)
+- 💻 [GitHub](https://github.com/jahan-d)

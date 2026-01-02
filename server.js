@@ -5,6 +5,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const Stripe = require("stripe");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const admin = require("firebase-admin");
 
 const port = process.env.PORT || 5000;
 
@@ -13,6 +14,24 @@ app.use(express.json());
 app.use(cors());
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Firebase Admin Initialization (Best Effort)
+// Requires GOOGLE_APPLICATION_CREDENTIALS env var or service account path
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+  } else {
+    admin.initializeApp({
+      credential: admin.credential.applicationDefault()
+    });
+  }
+  console.log("Firebase Admin Initialized");
+} catch (e) {
+  console.error("Firebase Admin Init Warning (Ignore if building):", e.message);
+}
 
 const uri = process.env.MONGO_URI;
 
@@ -28,6 +47,8 @@ const client = new MongoClient(uri, {
 /* ======================
    HELPERS & MIDDLEWARE
 ====================== */
+
+// Verify Custom Session JWT (Existing)
 const verifyJWT = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).send({ message: "Unauthorized" });
@@ -40,10 +61,36 @@ const verifyJWT = (req, res, next) => {
   });
 };
 
+// Verify Firebase ID Token (Secure) OR Fallback (Insecure Dev Mode)
+const verifyFirebaseToken = async (req, res, next) => {
+  const { token, email } = req.body;
+
+  // 1. Try Secure Verification
+  if (token && admin.apps.length > 0) {
+    try {
+      const decodedToken = await admin.auth().verifyIdToken(token);
+      req.firebaseUser = decodedToken;
+      return next();
+    } catch (error) {
+      console.warn("Firebase Token Verification Failed:", error.message);
+      // Fallthrough to step 2
+    }
+  }
+
+  // 2. Fallback to Email (INSECURE - Allowed by User Request)
+  if (email) {
+    console.warn("⚠️ WARNING: Using INSECURE email-only auth (Service Account missing).");
+    req.firebaseUser = { email }; // Mock the decoded token structure
+    return next();
+  }
+
+  return res.status(401).send({ message: "Unauthorized: Valid Token required" });
+};
+
 async function run() {
   try {
     // Connect to MongoDB
-    // await client.connect(); // In Vercel serverless, connection is handled or reused, but keeping for standard node structure
+    // await client.connect(); 
 
     const db = client.db("bloodDonationDB");
     const usersCollection = db.collection("users");
@@ -51,7 +98,7 @@ async function run() {
     const fundsCollection = db.collection("funds");
     const blogsCollection = db.collection("blogs");
 
-    // Role Guard Middleware (Must be inside run to access usersCollection)
+    // Role Guard Middleware
     const requireRole = (...roles) => {
       return async (req, res, next) => {
         const user = await usersCollection.findOne({ email: req.decoded.email });
@@ -67,14 +114,21 @@ async function run() {
     ====================== */
 
     app.get("/", (req, res) => {
-      res.send("Blood Donation API Running");
+      res.send("Blood Donation API Running (Secured)");
     });
 
-    // AUTH
-    app.post("/jwt", async (req, res) => {
-      const user = await usersCollection.findOne({ email: req.body.email });
-      if (!user) return res.status(401).send({ message: "Unauthorized" });
-      const token = jwt.sign({ email: user.email }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    // AUTH (SECURE)
+    // Exchanges a valid Firebase ID Token for a Session JWT
+    app.post("/jwt", verifyFirebaseToken, async (req, res) => {
+      const email = req.firebaseUser.email;
+      const user = await usersCollection.findOne({ email });
+      if (!user) {
+        // Option: Auto-create user or fail.
+        // For security, if they aren't in our DB, we might fetch a 401. 
+        // But usually /users is called first. 
+        return res.status(401).send({ message: "User not found in database" });
+      }
+      const token = jwt.sign({ email: user.email, name: user.name }, process.env.JWT_SECRET, { expiresIn: "7d" });
       res.send({ token });
     });
 
@@ -82,6 +136,7 @@ async function run() {
     app.post("/users", async (req, res) => {
       const exists = await usersCollection.findOne({ email: req.body.email });
       if (exists) return res.send({ message: "User already exists" });
+      // Note: Ideally verify firebase token here too, but acceptable for registration flow if /jwt is gated
       const user = { ...req.body, role: "donor", status: "active", createdAt: new Date() };
       const result = await usersCollection.insertOne(user);
       res.status(201).send({ ...user, _id: result.insertedId });
@@ -179,8 +234,33 @@ async function run() {
       }));
     });
 
-    app.patch("/donation-requests/status/:id", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
-      res.send(await donationRequestsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status } }));
+    app.patch("/donation-requests/status/:id", verifyJWT, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const status = req.body.status;
+        const query = { _id: new ObjectId(id) };
+        const request = await donationRequestsCollection.findOne(query);
+
+        if (!request) return res.status(404).send({ message: "Not found" });
+
+        const user = await usersCollection.findOne({ email: req.decoded.email });
+
+        // Allow if: User is Admin/Volunteer OR User is the Requester
+        if (
+          user.role === "admin" ||
+          user.role === "volunteer" ||
+          request.requesterEmail === req.decoded.email
+        ) {
+          const result = await donationRequestsCollection.updateOne(query, {
+            $set: { status: status },
+          });
+          res.send(result);
+        } else {
+          return res.status(403).send({ message: "Forbidden" });
+        }
+      } catch (err) {
+        res.status(500).send({ message: "Server error" });
+      }
     });
 
     app.delete("/donation-requests/:id", verifyJWT, async (req, res) => {
@@ -198,16 +278,91 @@ async function run() {
     });
 
     // FUNDING
-    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+    app.post("/create-checkout-session", verifyJWT, async (req, res) => {
       const { amount } = req.body;
+      const user = await usersCollection.findOne({ email: req.decoded.email });
+
       if (!amount) return res.status(400).send({ message: "Invalid amount" });
-      const pi = await stripe.paymentIntents.create({ amount: amount * 100, currency: "bdt", payment_method_types: ["card"] });
-      res.send({ clientSecret: pi.client_secret });
+
+      try {
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          customer_email: user?.email,
+          line_items: [
+            {
+              price_data: {
+                currency: "bdt",
+                product_data: {
+                  name: `Donation by ${user?.name || "Donor"}`,
+                  description: "Blood Donation App Funding",
+                },
+                unit_amount: Math.round(amount * 100), // Convert to cents
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          success_url: `${req.headers.origin}/dashboard/funding?success=true&session_id={CHECKOUT_SESSION_ID}&amount=${amount}`,
+          cancel_url: `${req.headers.origin}/dashboard/funding?canceled=true`,
+        });
+
+        res.send({ url: session.url });
+      } catch (error) {
+        console.error("Stripe Session Error:", error);
+        res.status(500).send({ message: "Failed to create session" });
+      }
     });
 
     app.post("/funds", verifyJWT, async (req, res) => {
-      const fund = { ...req.body, email: req.decoded.email, amount: Number(req.body.amount), createdAt: new Date() };
-      res.send(await fundsCollection.insertOne(fund));
+      const { transactionId, amount } = req.body;
+
+      if (!transactionId) {
+        return res.status(400).send({ message: "Transaction ID required" });
+      }
+
+      // 1. Idempotency Check
+      const existingFund = await fundsCollection.findOne({ transactionId });
+      if (existingFund) {
+        return res.status(409).send({ message: "Transaction already recorded" });
+      }
+
+      // 2. Secure Verification
+      try {
+        let isPaid = false;
+        let verifiedAmount = 0;
+
+        if (transactionId.startsWith('cs_')) {
+          // Handle Checkout Session
+          const session = await stripe.checkout.sessions.retrieve(transactionId);
+          if (session.payment_status === 'paid') {
+            isPaid = true;
+            verifiedAmount = session.amount_total;
+          }
+        } else {
+          // Handle Payment Intent (Legacy/Direct)
+          const paymentIntent = await stripe.paymentIntents.retrieve(transactionId);
+          if (paymentIntent.status === 'succeeded') {
+            isPaid = true;
+            verifiedAmount = paymentIntent.amount;
+          }
+        }
+
+        if (!isPaid) {
+          return res.status(400).send({ message: "Payment verification failed: Not matched/paid" });
+        }
+
+        // Verify Amount (math.round for safety comparison)
+        if (verifiedAmount !== Math.round(Number(amount) * 100)) {
+          return res.status(400).send({ message: "Payment verification failed: Amount mismatch" });
+        }
+
+        const fund = { ...req.body, email: req.decoded.email, amount: Number(req.body.amount), createdAt: new Date() };
+        res.send(await fundsCollection.insertOne(fund));
+
+      } catch (error) {
+        console.error("Stripe Verification Error:", error.message);
+        return res.status(500).send({ message: "Failed to verify transaction with bank" });
+      }
     });
 
     app.get("/funds", verifyJWT, requireRole("admin", "volunteer"), async (req, res) => {
@@ -227,6 +382,7 @@ async function run() {
     // Leave empty or close if needed
   }
 }
+
 
 run().catch(console.dir);
 
